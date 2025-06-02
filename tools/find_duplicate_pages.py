@@ -133,7 +133,8 @@ def process_data(df:pd.DataFrame, column:str):
     
     return df
 
-def identify_similar_pages(input_files: List[str], similarity_threshold: float = 0.9, output_folder:str=OUTPUT_FOLDER, progress=Progress(track_tqdm=True)):
+def identify_similar_pages(input_files: List[str], similarity_threshold: float = 0.9, output_folder:str=OUTPUT_FOLDER, min_char_count: int = 0, exclude_pages: List[tuple] = None, progress=Progress(track_tqdm=True)):
+    if exclude_pages is None: exclude_pages = []
     output_paths = []
     
     progress(0.1, desc="Cleaning input text")
@@ -141,6 +142,14 @@ def identify_similar_pages(input_files: List[str], similarity_threshold: float =
     # Load and clean data
     df, output_files = combine_ocr_output_text(input_files)
     output_paths.extend(output_files)
+
+    if min_char_count > 0:
+        df = df[df['text'].str.len() >= min_char_count]
+        df.reset_index(drop=True, inplace=True)
+
+    if df.empty: # Check after min_char_count filter
+        return pd.DataFrame(), output_paths
+
     df = process_data(df, 'text')  # Assume this returns 'text_clean', 'file', and 'page' columns
 
     # Vectorize text
@@ -154,7 +163,7 @@ def identify_similar_pages(input_files: List[str], similarity_threshold: float =
 
     # Extract indices of similar pages above threshold
     coo_matrix = similarity_matrix.tocoo()
-    similar_pages = np.array([(i, j, v) for i, j, v in zip(coo_matrix.row, coo_matrix.col, coo_matrix.data) if v > similarity_threshold])
+    similar_pages = np.array([(i, j, v) for i, j, v in zip(coo_matrix.row, coo_matrix.col, coo_matrix.data) if v > similarity_threshold and i != j])
 
     if similar_pages.size == 0:
         return pd.DataFrame(), output_paths  # Return empty if no matches
@@ -163,9 +172,64 @@ def identify_similar_pages(input_files: List[str], similarity_threshold: float =
 
     # Create a DataFrame for similar pairs
     similarity_df = pd.DataFrame(similar_pages, columns=['Page1_Index', 'Page2_Index', 'Similarity_Score'])
+
+    if exclude_pages: # ensure exclude_pages is not None (already handled by default param and init)
+        # 'df' here is the one that was vectorized. Its indices match Page1_Index and Page2_Index.
+        map_df_for_exclusion = df[['file', 'page']].copy()
+        # map_df_for_exclusion.index will match the indices in similarity_df (Page1_Index, Page2_Index)
+        map_df_for_exclusion['file_page_id_temp'] = map_df_for_exclusion['file'].astype(str) + "_page_" + map_df_for_exclusion['page'].astype(str)
+
+        user_excluded_file_page_ids_set = {f"{file_val}_page_{page_val}" for file_val, page_val in exclude_pages}
+
+        indices_of_user_excluded_pages = set(
+            map_df_for_exclusion[map_df_for_exclusion['file_page_id_temp'].isin(user_excluded_file_page_ids_set)].index
+        )
+
+        if indices_of_user_excluded_pages:
+            indices_to_fully_remove = set(indices_of_user_excluded_pages)
+
+            # Iteratively find all pages connected to the user_excluded_pages via similarity
+            # Using a fixed number of iterations for simplicity and performance.
+            # 3 iterations should cover A->B, B->C, C->D type chains for most practical purposes.
+            num_iterations = 3
+
+            for _ in range(num_iterations):
+                if similarity_df.empty:
+                    break
+
+                newly_tainted_this_iteration = set()
+
+                page1_is_in_remove_set = similarity_df['Page1_Index'].isin(indices_to_fully_remove)
+                page2_is_in_remove_set = similarity_df['Page2_Index'].isin(indices_to_fully_remove)
+
+                # Taint Page2 if Page1 is in remove_set and Page2 is not yet
+                tainted_page2s = similarity_df.loc[page1_is_in_remove_set & ~page2_is_in_remove_set, 'Page2_Index']
+                newly_tainted_this_iteration.update(tainted_page2s)
+
+                # Taint Page1 if Page2 is in remove_set and Page1 is not yet
+                tainted_page1s = similarity_df.loc[page2_is_in_remove_set & ~page1_is_in_remove_set, 'Page1_Index']
+                newly_tainted_this_iteration.update(tainted_page1s)
+
+                if not newly_tainted_this_iteration:
+                    break
+                indices_to_fully_remove.update(newly_tainted_this_iteration)
+
+            # Filter similarity_df to remove any pair involving a page marked for full removal
+            if not similarity_df.empty: # Check before filtering
+                similarity_df = similarity_df[
+                    ~similarity_df['Page1_Index'].isin(indices_to_fully_remove) &
+                    ~similarity_df['Page2_Index'].isin(indices_to_fully_remove)
+                ]
+
+            if similarity_df.empty:
+                 return pd.DataFrame(), output_paths
+    # End of 'if exclude_pages:'
+
+    if not similarity_df.empty: # Check if not empty before trying to filter
+        similarity_df = similarity_df[similarity_df['Page1_Index'] < similarity_df['Page2_Index']]
     
-    # Remove duplicate pairs (keep one direction)
-    similarity_df = similarity_df[similarity_df['Page1_Index'] < similarity_df['Page2_Index']]
+    if similarity_df.empty:
+        return pd.DataFrame(), output_paths
 
     progress(0.8, desc="Mapping back results")
     # Map indices to metadata
@@ -198,8 +262,18 @@ def identify_similar_pages(input_files: List[str], similarity_threshold: float =
     similarity_df_out = similarity_df[['Page1_File', 'Page1_Page', 'Page2_File', 'Page2_Page', 'Similarity_Score', 'Page1_Text', 'Page2_Text']]
     similarity_df_out = similarity_df_out.sort_values(["Page1_File", "Page1_Page", "Page2_File", "Page2_Page", "Similarity_Score"], ascending=[True, True, True, True, False])
 
-    similarity_df_out['Page1_Text'] = similarity_df_out['Page1_Text'][0:100]
-    similarity_df_out['Page2_Text'] = similarity_df_out['Page2_Text'][0:100]
+    # Ensure the full text is kept
+    # similarity_df_out['Page1_Text'] = similarity_df_out['Page1_Text']
+    # similarity_df_out['Page2_Text'] = similarity_df_out['Page2_Text']
+    # No change needed here if the truncation was happening on assignment,
+    # but the original code was:
+    # similarity_df['Page1_Text'] = similarity_df['Page1_Index'].map(lambda x: index_map[x]['text'][0:200])
+    # similarity_df['Page2_Text'] = similarity_df['Page2_Index'].map(lambda x: index_map[x]['text'][0:200])
+    # This was changed in a later refactor in the original file to merge directly, which brings the full text.
+    # The lines:
+    # similarity_df_out['Page1_Text'] = similarity_df_out['Page1_Text'][0:100]
+    # similarity_df_out['Page2_Text'] = similarity_df_out['Page2_Text'][0:100]
+    # should be REMOVED to ensure full text is passed.
 
     progress(0.8, desc="Saving output files")
 
